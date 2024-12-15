@@ -1,9 +1,22 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from functools import reduce
 import os
+# Control Constants
 
-### HELPER
+# Window: 
+# -- Decides width of all moving stats
+# -- Each day varies but is order of 1000 datapoints 
+window_width = 10000
+# Cutoff Factor:
+# -- Decides how much data from the beginning we cut off (window width * cutoff_factor) 
+# -- Done because small sample size at beginning --> chaotic behavior
+cutoff_factor = 1/10
+# Z Score Requirement:
+# -- Long when largest > median + zscore_req
+# -- Short when smallest < median - zscore_req
+zscore_req = 0.55
 
 data_folder = "data/"
 
@@ -11,8 +24,9 @@ def create_numeric_time_column(df):
     df["FULL_DATE"] = pd.to_datetime(df["DATE"] + " " + df["TIME"])
     df["TIME_NUMERIC"] = df['FULL_DATE'].astype('int64') // 10 ** 9 # nanoseconds to seconds
 
-def standardize_series(series):
-    return (series - series.mean()) / series.std()
+def create_moving_stats(df):
+    stat_window = df["OPEN"].rolling(window_width, min_periods = 1)
+    df["MOVING Z"] = (df["OPEN"] - stat_window.mean()) / stat_window.std()
 
 ### WORKING WITH SINGLE-DAY DATA
 
@@ -110,27 +124,76 @@ create_numeric_time_column(full_df)
 create_numeric_time_column(full_df_mnq)
 create_numeric_time_column(full_df_mym)
 
-# Standardize closing prices
-full_df["CLOSE_STANDARDIZED"] = standardize_series(full_df["CLOSE"])
-full_df_mnq["CLOSE_STANDARDIZED"] = standardize_series(full_df_mnq["CLOSE"])
-full_df_mym["CLOSE_STANDARDIZED"] = standardize_series(full_df_mym["CLOSE"])
+create_moving_stats(full_df)
+create_moving_stats(full_df_mnq)
+create_moving_stats(full_df_mym)
+
+# Most basic model: No trading penalty
+# x = MES, y = MNQ, no label = MYM
+
+dfs = [full_df, full_df_mnq, full_df_mym]
+collected_prices = reduce(lambda left, right : pd.merge(left, right, on = "TIME_NUMERIC", how = "inner"), dfs)
+
+filtered = collected_prices.loc[:, ["TIME_NUMERIC", "OPEN", "OPEN_x", "OPEN_y", "MOVING Z", "MOVING Z_x", "MOVING Z_y"]].dropna()
+filtered = filtered.iloc[int(window_width * cutoff_factor):, :]
+
+filtered["SMALLEST"] = filtered[["MOVING Z", "MOVING Z_x", "MOVING Z_y"]].min(axis = 1)
+filtered["MIDDLE"] = filtered[["MOVING Z", "MOVING Z_x", "MOVING Z_y"]].median(axis = 1)
+filtered["LARGEST"] = filtered[["MOVING Z", "MOVING Z_x", "MOVING Z_y"]].max(axis = 1)
+
+filtered["LONG"] = filtered["LARGEST"] - filtered["MIDDLE"] > zscore_req
+filtered["SHORT"] = filtered["MIDDLE"] - filtered["SMALLEST"] > zscore_req
+
+filtered["LONG/SHORT"] = np.where(filtered["MOVING Z"] == filtered["LARGEST"], 
+                                  np.where(filtered["LONG"], 1, 0),
+                                  np.where(filtered["MOVING Z"] == filtered["SMALLEST"],
+                                           np.where(filtered["SHORT"], -1, 0), 0))
+filtered["LONG/SHORT_x"] = np.where(filtered["MOVING Z_x"] == filtered["LARGEST"], 
+                                  np.where(filtered["LONG"], 1, 0),
+                                  np.where(filtered["MOVING Z_x"] == filtered["SMALLEST"],
+                                           np.where(filtered["SHORT"], -1, 0), 0))
+filtered["LONG/SHORT_y"] = np.where(filtered["MOVING Z_y"] == filtered["LARGEST"], 
+                                  np.where(filtered["LONG"], 1, 0),
+                                  np.where(filtered["MOVING Z_y"] == filtered["SMALLEST"],
+                                           np.where(filtered["SHORT"], -1, 0), 0))
+
+filtered["TOTAL WEIGHT"] = (np.abs(filtered["LONG/SHORT"]) 
+                            + np.abs(filtered["LONG/SHORT_x"]) 
+                            + np.abs(filtered["LONG/SHORT_y"]))
+
+filtered["RETURNS"] = filtered["OPEN"].pct_change()
+filtered["RETURNS_x"] = filtered["OPEN_x"].pct_change()
+filtered["RETURNS_y"] = filtered["OPEN_y"].pct_change()
+
+filtered["STRAT RETURNS"] = np.where(filtered["TOTAL WEIGHT"] == 0, 
+                        0,
+                        (filtered["RETURNS"] * filtered["LONG/SHORT"]
+                          + filtered["RETURNS_x"] * filtered["LONG/SHORT_x"]
+                          + filtered["RETURNS_y"] * filtered["LONG/SHORT_y"]) / filtered["TOTAL WEIGHT"])
+
+filtered["EQ RETURNS"] = (filtered["RETURNS"] + filtered["RETURNS_x"] + filtered["RETURNS_y"])/3
+
+filtered["STRAT LOG RETURNS"] = np.log(1 + filtered["STRAT RETURNS"])
+filtered["EQ LOG RETURNS"] = np.log(1 + filtered["EQ RETURNS"])
+
+filtered["CUMUL STRAT LOG RETURNS"] = filtered["STRAT LOG RETURNS"].cumsum()
+filtered["CUMUL EQ LOG RETURNS"] = filtered["EQ LOG RETURNS"].cumsum()
+
+pd.set_option('display.max_rows', 100)
+pd.set_option('display.max_columns', 100)
+print(filtered.describe())
 
 # Plot the standardized prices
-plt.plot(full_df["TIME_NUMERIC"], full_df["CLOSE_STANDARDIZED"], label="MES Standardized Close")
-plt.plot(full_df_mnq["TIME_NUMERIC"], full_df_mnq["CLOSE_STANDARDIZED"], label="MNQ Standardized Close")
-plt.plot(full_df_mym["TIME_NUMERIC"], full_df_mym["CLOSE_STANDARDIZED"], label="MYM Standardized Close")
+#plt.plot(full_df["TIME_NUMERIC"], full_df["MOVING Z"], label="MES Standardized Open")
+#plt.plot(full_df_mnq["TIME_NUMERIC"], full_df_mnq["MOVING Z"], label="MNQ Standardized Open")
+#plt.plot(full_df_mym["TIME_NUMERIC"], full_df_mym["MOVING Z"], label="MYM Standardized Open")
+
+#plt.plot(filtered["TIME_NUMERIC"], filtered["MOVING Z"], label="MYM Standardized Open")
+#plt.plot(filtered["TIME_NUMERIC"], filtered["MOVING Z_x"], label="MES Standardized Open")
+#plt.plot(filtered["TIME_NUMERIC"], filtered["MOVING Z_y"], label="MNQ Standardized Open")
+
+plt.plot(filtered["CUMUL EQ LOG RETURNS"], label = "Eq")
+plt.plot(filtered["CUMUL STRAT LOG RETURNS"], label = "Strat")
+
 plt.legend()
 plt.show()
-
-### sub-DFs of prior to large downward and upward moves
-    # current logic (arbitrary): first 10% of move's time period for signal, then enter a position
-downward_1 = full_df[(full_df["TIME_NUMERIC"] < 1.725380 * 10 ** 9) & (full_df["TIME_NUMERIC"] > 1.725337 * 10 ** 9)]
-pre_downward_1 = downward_1[:int(len(downward_1) * 0.1)]
-
-downward_2 = full_df[(full_df["TIME_NUMERIC"] < 1.725650 * 10 ** 9) & (full_df["TIME_NUMERIC"] > 1.725618 * 10 ** 9)]
-downward_3 = full_df[(full_df["TIME_NUMERIC"] < 1.726582 * 10 ** 9) & (full_df["TIME_NUMERIC"] > 1.726570 * 10 ** 9)]
-downward_4 = full_df[(full_df["TIME_NUMERIC"] < 1.727773 * 10 ** 9) & (full_df["TIME_NUMERIC"] > 1.727765 * 10 ** 9)]
-
-downward = pd.concat([downward_1, downward_2, downward_3, downward_4])
-
-### OVERLAYS (BOTH SINGLE-DAY & MONTH-LONG)
