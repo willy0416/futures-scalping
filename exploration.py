@@ -6,17 +6,20 @@ import os
 # Control Constants
 
 # Window: 
-# -- Decides width of all moving stats
+# -- Decides maximum width of all moving stats
 # -- Each day varies but is order of 1000 datapoints 
-window_width = 10000
+window_width = 100000
 # Cutoff Factor:
 # -- Decides how much data from the beginning we cut off (window width * cutoff_factor) 
 # -- Done because small sample size at beginning --> chaotic behavior
-cutoff_factor = 1/10
-# Z Score Requirement:
-# -- Long when largest > median + zscore_req
-# -- Short when smallest < median - zscore_req
-zscore_req = 0.55
+cutoff_factor = 1/100
+# Z Score Entrance Requirement:
+# -- Short largest when largest > middle + zscore_req
+# -- Long smallest when smallest < middle - zscore_req
+zscore_req = 0.6
+# Z Score Exit Requirement:
+# -- Sell when zscore difference reaches this
+zscore_exit = 0.0
 
 data_folder = "data/"
 
@@ -27,6 +30,10 @@ def create_numeric_time_column(df):
 def create_moving_stats(df):
     stat_window = df["OPEN"].rolling(window_width, min_periods = 1)
     df["MOVING Z"] = (df["OPEN"] - stat_window.mean()) / stat_window.std()
+
+# for data display purposes only -- DO NOT backtest with these
+def create_standardized_stats(df):
+    df["TRUE Z"] =  (df["OPEN"] - df["OPEN"].mean()) / df["OPEN"].std()
 
 ### WORKING WITH SINGLE-DAY DATA
 
@@ -128,22 +135,75 @@ create_moving_stats(full_df)
 create_moving_stats(full_df_mnq)
 create_moving_stats(full_df_mym)
 
+create_standardized_stats(full_df)
+create_standardized_stats(full_df_mnq)
+create_standardized_stats(full_df_mym)
+
 # Most basic model: No trading penalty
 # x = MES, y = MNQ, no label = MYM
 
 dfs = [full_df, full_df_mnq, full_df_mym]
 collected_prices = reduce(lambda left, right : pd.merge(left, right, on = "TIME_NUMERIC", how = "inner"), dfs)
 
-filtered = collected_prices.loc[:, ["TIME_NUMERIC", "OPEN", "OPEN_x", "OPEN_y", "MOVING Z", "MOVING Z_x", "MOVING Z_y"]].dropna()
+# The opening prices and moving z-scores.
+filtered = collected_prices.loc[:, ["TIME_NUMERIC", "OPEN", "OPEN_x", "OPEN_y", "MOVING Z", "MOVING Z_x", "MOVING Z_y", "TRUE Z", "TRUE Z_x", "TRUE Z_y"]].dropna()
+# Cut off beginning due to small sample size --> very high z score volatility
 filtered = filtered.iloc[int(window_width * cutoff_factor):, :]
 
+# Identify rankings
 filtered["SMALLEST"] = filtered[["MOVING Z", "MOVING Z_x", "MOVING Z_y"]].min(axis = 1)
 filtered["MIDDLE"] = filtered[["MOVING Z", "MOVING Z_x", "MOVING Z_y"]].median(axis = 1)
 filtered["LARGEST"] = filtered[["MOVING Z", "MOVING Z_x", "MOVING Z_y"]].max(axis = 1)
 
-filtered["LONG"] = filtered["LARGEST"] - filtered["MIDDLE"] > zscore_req
-filtered["SHORT"] = filtered["MIDDLE"] - filtered["SMALLEST"] > zscore_req
+# Entrance indicator variable
+filtered["TRADE_ENTER"] = filtered["LARGEST"] - filtered["SMALLEST"] > zscore_req
 
+# Exit indicator variable; mutually exclusive with entrance (ofc)
+filtered["TRADE_EXIT"] = filtered["LARGEST"] - filtered["SMALLEST"] < zscore_exit
+
+filtered["LONG/SHORT"] = 0
+filtered["LONG/SHORT_x"] = 0
+filtered["LONG/SHORT_y"] = 0
+
+def reset_trades(i):
+    filtered["LONG/SHORT"].iloc[i] = 0
+    filtered["LONG/SHORT_x"].iloc[i] = 0
+    filtered["LONG/SHORT_y"].iloc[i] = 0
+def long_smallest(i):
+    if filtered["MOVING Z"].iloc[i] == filtered["SMALLEST"].iloc[i]:
+        filtered["LONG/SHORT"].iloc[i] = 1
+    if filtered["MOVING Z_x"].iloc[i] == filtered["SMALLEST"].iloc[i]:
+        filtered["LONG/SHORT_x"].iloc[i] = 1
+    if filtered["MOVING Z_y"].iloc[i] == filtered["SMALLEST"].iloc[i]:
+        filtered["LONG/SHORT_y"].iloc[i] = 1
+def short_largest(i):
+    if filtered["MOVING Z"].iloc[i] == filtered["LARGEST"].iloc[i]:
+        filtered["LONG/SHORT"].iloc[i] = -1
+    if filtered["MOVING Z_x"].iloc[i] == filtered["LARGEST"].iloc[i]:
+        filtered["LONG/SHORT_x"].iloc[i] = -1
+    if filtered["MOVING Z_y"].iloc[i] == filtered["LARGEST"].iloc[i]:
+        filtered["LONG/SHORT_y"].iloc[i] = -1
+
+
+for i in range(filtered.shape[0]):
+    # Persistence of investments
+    if i != 0: 
+        filtered["LONG/SHORT"].iloc[i] = filtered["LONG/SHORT"].iloc[i - 1]
+        filtered["LONG/SHORT_x"].iloc[i] = filtered["LONG/SHORT_x"].iloc[i - 1]
+        filtered["LONG/SHORT_y"].iloc[i] = filtered["LONG/SHORT_y"].iloc[i - 1]
+
+    if filtered["TRADE_ENTER"].iloc[i]:
+        # Delete existing trade
+        reset_trades(i)
+        # Hedged bet that they'll reunite
+        short_largest(i)
+        long_smallest(i)
+    if filtered["TRADE_EXIT"].iloc[i]:
+        # Delete existing trade (selling)
+        reset_trades(i)
+
+
+"""
 filtered["LONG/SHORT"] = np.where(filtered["MOVING Z"] == filtered["LARGEST"], 
                                   np.where(filtered["LONG"], 1, 0),
                                   np.where(filtered["MOVING Z"] == filtered["SMALLEST"],
@@ -156,7 +216,7 @@ filtered["LONG/SHORT_y"] = np.where(filtered["MOVING Z_y"] == filtered["LARGEST"
                                   np.where(filtered["LONG"], 1, 0),
                                   np.where(filtered["MOVING Z_y"] == filtered["SMALLEST"],
                                            np.where(filtered["SHORT"], -1, 0), 0))
-
+"""
 filtered["TOTAL WEIGHT"] = (np.abs(filtered["LONG/SHORT"]) 
                             + np.abs(filtered["LONG/SHORT_x"]) 
                             + np.abs(filtered["LONG/SHORT_y"]))
@@ -179,21 +239,22 @@ filtered["EQ LOG RETURNS"] = np.log(1 + filtered["EQ RETURNS"])
 filtered["CUMUL STRAT LOG RETURNS"] = filtered["STRAT LOG RETURNS"].cumsum()
 filtered["CUMUL EQ LOG RETURNS"] = filtered["EQ LOG RETURNS"].cumsum()
 
-pd.set_option('display.max_rows', 100)
-pd.set_option('display.max_columns', 100)
-print(filtered.describe())
+#pd.set_option('display.max_rows', 100)
+#pd.set_option('display.max_columns', 100)
+#print(filtered.describe())
 
 # Plot the standardized prices
-#plt.plot(full_df["TIME_NUMERIC"], full_df["MOVING Z"], label="MES Standardized Open")
-#plt.plot(full_df_mnq["TIME_NUMERIC"], full_df_mnq["MOVING Z"], label="MNQ Standardized Open")
-#plt.plot(full_df_mym["TIME_NUMERIC"], full_df_mym["MOVING Z"], label="MYM Standardized Open")
+#plt.plot(full_df_mym["TIME_NUMERIC"], full_df_mym["TRUE Z"], label="MYM Standardized Open")
+#plt.plot(full_df["TIME_NUMERIC"], full_df["TRUE Z"], label="MES Standardized Open")
+#plt.plot(full_df_mnq["TIME_NUMERIC"], full_df_mnq["TRUE Z"], label="MNQ Standardized Open")
 
 #plt.plot(filtered["TIME_NUMERIC"], filtered["MOVING Z"], label="MYM Standardized Open")
 #plt.plot(filtered["TIME_NUMERIC"], filtered["MOVING Z_x"], label="MES Standardized Open")
 #plt.plot(filtered["TIME_NUMERIC"], filtered["MOVING Z_y"], label="MNQ Standardized Open")
 
-plt.plot(filtered["CUMUL EQ LOG RETURNS"], label = "Eq")
-plt.plot(filtered["CUMUL STRAT LOG RETURNS"], label = "Strat")
+plt.plot(filtered["TIME_NUMERIC"], filtered["CUMUL EQ LOG RETURNS"], label = "Eq")
+plt.plot(filtered["TIME_NUMERIC"], filtered["CUMUL STRAT LOG RETURNS"], label = "Strat")
 
 plt.legend()
 plt.show()
+
